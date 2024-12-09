@@ -183,6 +183,8 @@ class _MetaAbstractArray(type):
     def __instancecheck_str__(cls, obj: Any) -> str:
         if cls._skip_instancecheck:
             return ""
+        if hasattr(obj, "value"):
+            obj = obj.value
         if cls.array_type is Any:
             if not (hasattr(obj, "shape") and hasattr(obj, "dtype")):
                 return "this value does not have both `shape` and `dtype` attributes."
