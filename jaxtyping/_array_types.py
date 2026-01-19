@@ -118,6 +118,12 @@ class _SymbolicDim:
     broadcastable: bool
 
 
+@dataclass(frozen=True)
+class _SymbolicArgSplicingDim:
+    elem: Any
+    broadcastable: bool
+
+
 _AbstractDimOrVariadicDim = Union[
     Literal[_anonymous_dim],
     Literal[_anonymous_variadic_dim],
@@ -125,6 +131,7 @@ _AbstractDimOrVariadicDim = Union[
     _NamedVariadicDim,
     _FixedDim,
     _SymbolicDim,
+    _SymbolicArgSplicingDim,
 ]
 _AbstractDim = Union[Literal[_anonymous_dim], _NamedDim, _FixedDim, _SymbolicDim]
 
@@ -184,6 +191,9 @@ def _dtype_is_numpy_struct_array(dtype):
         and (dtype.type.__name__ == "void")
         and (dtype is not np.dtype(np.void))
     )
+
+
+_spliced_arg_dim_pattern = re.compile(r"\*{(\w+)}")
 
 
 class _MetaAbstractArray(type):
@@ -261,6 +271,95 @@ class _MetaAbstractArray(type):
             )
             return check
 
+    def _find_spliced_shape_and_range(
+        cls, arg_memo: dict[str, Any]
+    ) -> tuple[int, int, list[tuple[int]], int]:
+        spliced_shapes = []
+        spliced_i_before_variadic = None
+        if len(cls.indices_splicing) == 0:
+            i = cls.index_variadic
+            j = -(len(cls.dims) - i - 1)
+            if j == 0:
+                j = None
+            return i, j, spliced_shapes, spliced_i_before_variadic
+        else:
+            last_dim_i = 0
+            i, j = 0, None
+            for spliced_i, dim_i in enumerate(cls.indices_splicing):
+                arg_splicing_dim = cls.dims[dim_i]
+                eval_shape = eval(arg_splicing_dim.elem[1:-1], arg_memo.copy())
+                if isinstance(eval_shape, int):
+                    eval_shape = (eval_shape,)
+                spliced_shapes.append(tuple(eval_shape))
+                if cls.index_variadic is None or dim_i < cls.index_variadic:
+                    i += len(eval_shape) + dim_i - last_dim_i
+                    spliced_i_before_variadic = spliced_i
+                else:
+                    if j is None:
+                        j = len(eval_shape) + dim_i - (cls.index_variadic + 1)
+                        i += cls.index_variadic - last_dim_i
+                    else:
+                        j += len(eval_shape) + dim_i - last_dim_i
+                last_dim_i = dim_i + 1
+
+            if j is None:
+                if cls.index_variadic is None:
+                    i += len(cls.dims) - last_dim_i
+                else:
+                    i += cls.index_variadic - last_dim_i
+                    suffix_len = len(cls.dims) - (cls.index_variadic + 1)
+                    if suffix_len > 0:
+                        j = suffix_len
+                spliced_i_before_variadic = len(cls.indices_splicing)
+            else:
+                j += len(cls.dims) - last_dim_i
+
+            if j is not None:
+                j = -j
+
+            return i, j, spliced_shapes, spliced_i_before_variadic
+
+    def _check_and_drop_shape_dim(
+        cls,
+        dims: tuple[_AbstractDim, ...],
+        shape: tuple[int, ...],
+        spliced_shapes: list[tuple[int, ...]],
+    ) -> tuple[tuple[_AbstractDim, ...], tuple[int, ...]]:
+        new_dims = []
+        new_shape = []
+        shape_idx = 0
+        spliced_shapes_iter = iter(spliced_shapes)
+
+        for dim in dims:
+            if isinstance(dim, _SymbolicArgSplicingDim):
+                # Consume the next spliced shape
+                try:
+                    current_spliced_shape = next(spliced_shapes_iter)
+                except StopIteration:
+                    # Should not happen if logic is correct
+                    raise RuntimeError("Spliced shapes and dims mismatch")
+
+                spliced_len = len(current_spliced_shape)
+
+                # Check mismatch manually and insert reasonable feedback
+                for k in range(spliced_len):
+                    expected_size = current_spliced_shape[k]
+                    new_dims.append(
+                        _FixedDim(expected_size, broadcastable=dim.broadcastable)
+                    )
+                    if shape_idx < len(shape):
+                        new_shape.append(shape[shape_idx])
+                    else:
+                        pass
+                    shape_idx += 1
+            else:
+                new_dims.append(dim)
+                if shape_idx < len(shape):
+                    new_shape.append(shape[shape_idx])
+                shape_idx += 1
+
+        return tuple(new_dims), tuple(new_shape)
+
     def _check_shape(
         cls,
         obj,
@@ -268,29 +367,65 @@ class _MetaAbstractArray(type):
         variadic_memo: dict[str, tuple[bool, tuple[int, ...]]],
         arg_memo: dict[str, Any],
     ) -> str:
-        if cls.index_variadic is None:
+        if cls.index_variadic is None and len(cls.indices_splicing) == 0:
             if len(obj.shape) != len(cls.dims):
                 return f"this array has {len(obj.shape)} dimensions, not the {len(cls.dims)} expected by the type hint"  # noqa: E501
             return _check_dims(cls.dims, obj.shape, single_memo, arg_memo)
         else:
-            if len(obj.shape) < len(cls.dims) - 1:
-                return f"this array has {len(obj.shape)} dimensions, which is fewer than {len(cls.dims) - 1} that is the minimum expected by the type hint"  # noqa: E501
-            i = cls.index_variadic
-            j = -(len(cls.dims) - i - 1)
-            if j == 0:
-                j = None
-            prefix_check = _check_dims(
-                cls.dims[:i], obj.shape[:i], single_memo, arg_memo
+            minimum_shape = (
+                len(cls.dims)
+                - int(cls.index_variadic is not None)
+                - len(cls.indices_splicing)
             )
+            if len(obj.shape) < minimum_shape:
+                return f"this array has {len(obj.shape)} dimensions, which is fewer than {minimum_shape} that is the minimum expected by the type hint"  # noqa: E501
+
+            i, j, spliced_shapes, spliced_i_before_variadic = (
+                cls._find_spliced_shape_and_range(arg_memo)
+            )
+            if cls.index_variadic is None:
+                new_dims = cls.dims
+            else:
+                new_dims = cls.dims[: cls.index_variadic]
+            new_shape = obj.shape[:i]
+
+            # Determine split point for spliced_shapes
+            if spliced_i_before_variadic is not None:
+                # spliced_i_before_variadic is the index of the last spliced dim
+                # before variadic.
+                # So we slice up to +1.
+                split_point = spliced_i_before_variadic + 1
+                new_dims, new_shape = cls._check_and_drop_shape_dim(
+                    new_dims, new_shape, spliced_shapes[:split_point]
+                )
+            else:
+                split_point = 0
+
+            if len(new_dims) != len(new_shape):
+                return f"this array has {len(obj.shape)} dimensions, not the {i} expected by the type hint"  # noqa: E501
+            prefix_check = _check_dims(new_dims, new_shape, single_memo, arg_memo)
             if prefix_check != "":
                 return prefix_check
+            if cls.index_variadic is None:
+                if len(obj.shape) != i:
+                    return f"this array has {len(obj.shape)} dimensions, not the {i} expected by the type hint"  # noqa: E501
+                return ""
             if j is not None:
+                suffix_dims = cls.dims[cls.index_variadic + 1 :]
+                suffix_shape = obj.shape[j:]
+                # Handle suffix splicing
+                if split_point < len(spliced_shapes):
+                    suffix_dims, suffix_shape = cls._check_and_drop_shape_dim(
+                        suffix_dims, suffix_shape, spliced_shapes[split_point:]
+                    )
+
                 suffix_check = _check_dims(
-                    cls.dims[j:], obj.shape[j:], single_memo, arg_memo
+                    suffix_dims, suffix_shape, single_memo, arg_memo
                 )
                 if suffix_check != "":
                     return suffix_check
-            variadic_dim = cls.dims[i]
+            variadic_dim = cls.dims[cls.index_variadic]
+
             if variadic_dim is _anonymous_variadic_dim:
                 return ""
             else:
@@ -369,6 +504,7 @@ class AbstractArray(metaclass=_MetaAbstractArray):
     dtypes: list[str]
     dims: tuple[_AbstractDimOrVariadicDim, ...]
     index_variadic: Optional[int]
+    indices_splicing: list[int]
 
     def __new__(cls, *args, **kwargs):
         raise RuntimeError(
@@ -392,12 +528,14 @@ def _make_array_cached(array_type, dim_str, dtypes, name):
             "spaces."
         )
     dims = []
+    indices_splicing = []
     index_variadic = None
     for index, elem in enumerate(dim_str.split()):
-        if "," in elem and "(" not in elem:
+        if "," in elem and not ("(" in elem or "{" in elem):
             # Common mistake.
             # Disable in the case that there's brackets to allow for function calls,
             # e.g. `min(foo,bar)`, in symbolic axes.
+            # Disable also in the case of symbolic splicing exp, e.g. *{[1,2,3]}
             raise ValueError("Axes should be separated with spaces, not commas")
         if elem.endswith("#"):
             raise ValueError(
@@ -474,11 +612,15 @@ def _make_array_cached(array_type, dim_str, dtypes, name):
                     dim_type = _DimType.fixed
 
         if variadic:
-            if index_variadic is not None:
-                raise ValueError(
-                    "Cannot use variadic specifiers (`*name` or `...`) more than once."
-                )
-            index_variadic = index
+            if dim_type is _DimType.named:
+                if index_variadic is not None:
+                    raise ValueError(
+                        "Cannot use non-symbolic variadic specifiers (`*name` or `...`)"
+                        " more than once."
+                    )
+                index_variadic = index
+            else:
+                indices_splicing.append(index)
 
         if dim_type is _DimType.fixed:
             if variadic:
@@ -520,15 +662,19 @@ def _make_array_cached(array_type, dim_str, dtypes, name):
                     "`_foo+bar` is not allowed"
                 )
             if variadic:
-                raise ValueError(
-                    "Cannot have symbolic multiple-axes, e.g. `*foo+bar` is not allowed"
-                )
+                if not (elem[0] == "{" and elem[-1] == "}"):
+                    raise ValueError(
+                        "Cannot have non-f-string symbolic variadic, e.g. "
+                        "`*foo+bar` is not allowed."
+                    )
+                elem = _SymbolicArgSplicingDim(elem, broadcastable)
             if treepath:
                 raise ValueError(
                     "Cannot have a symbolic axis with tree-path dependence, e.g. "
                     "`?foo+bar` is not allowed"
                 )
-            elem = _SymbolicDim(elem, broadcastable)
+            if not variadic:
+                elem = _SymbolicDim(elem, broadcastable)
         dims.append(elem)
     dims = tuple(dims)
 
@@ -589,6 +735,9 @@ def _make_array_cached(array_type, dim_str, dtypes, name):
                 )
         dims = dims + array_type.dims
         dim_str = dim_str + " " + array_type.dim_str
+        indices_splicing = indices_splicing + [
+            i + len(dims) for i in array_type.indices_splicing
+        ]
         array_type = array_type.array_type
     try:
         type_str = array_type.__name__
@@ -601,14 +750,14 @@ def _make_array_cached(array_type, dim_str, dtypes, name):
     else:
         raise ValueError(f"array_name_format {_array_name_format} not recognised")
 
-    return (array_type, name, dtypes, dims, index_variadic, dim_str)
+    return (array_type, name, dtypes, dims, index_variadic, indices_splicing, dim_str)
 
 
 def _make_array(x, dim_str, dtype):
     out = _make_array_cached(x, dim_str, dtype.dtypes, dtype.__name__)
 
     if type(out) is tuple:
-        array_type, name, dtypes, dims, index_variadic, dim_str = out
+        array_type, name, dtypes, dims, index_variadic, indices_splicing, dim_str = out
 
         out = _MetaAbstractArray(
             name,
@@ -620,6 +769,7 @@ def _make_array(x, dim_str, dtype):
                 dtypes=dtypes,
                 dims=dims,
                 index_variadic=index_variadic,
+                indices_splicing=indices_splicing,
             ),
         )
         if getattr(typing, "GENERATING_DOCUMENTATION", "") in {"", "jaxtyping"}:
